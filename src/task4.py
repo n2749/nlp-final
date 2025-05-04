@@ -146,8 +146,8 @@ def t5_translation():
 
 def main():
     # Uncomment to run a model
-    # bert()
-    gpt()
+    bert()
+    # gpt()
     # t5_translation()
 
 

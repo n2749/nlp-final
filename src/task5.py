@@ -1,105 +1,78 @@
 import spacy
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForTokenClassification, TrainingArguments, Trainer
-from transformers import DataCollatorForTokenClassification
 from transformers import pipeline
-import evaluate
-import numpy as np
+from sklearn.metrics import precision_recall_fscore_support
 import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score, f1_score
 
 
-def load_news_articles(sample_size=5):
-    dataset = load_dataset("ag_news")
-    articles = dataset["train"]["text"][:sample_size]
-    return articles
+def load_conll_dataset():
+    dataset = load_dataset("conll2003")
+    return dataset["validation"]
 
 
-def perform_ner(nlp, texts):
-    for i, doc in enumerate(nlp.pipe(texts)):
-        print(f"\n--- Article {i + 1} ---")
-        print(texts[i])
-        print("\nNamed Entities:")
+def extract_spacy_entities(nlp, tokens_list):
+    all_preds = []
+    for tokens in tokens_list:
+        text = " ".join(tokens)
+        doc = nlp(text)
+        pred_labels = ["O"] * len(tokens)
         for ent in doc.ents:
-            print(f"  - {ent.text} ({ent.label_})")
+            ent_tokens = ent.text.split()
+            for i, token in enumerate(tokens):
+                if token in ent_tokens:
+                    pred_labels[i] = "B-" + ent.label_ if i == 0 else "I-" + ent.label_
+        all_preds.append(pred_labels)
+    return all_preds
 
 
-def perform_ner_with_transformers():
-    model_checkpoint = "dslim/bert-base-NER"
-    nlp_ner = pipeline("ner", model=model_checkpoint, tokenizer=model_checkpoint, aggregation_strategy="simple")
-
-    sample_texts = load_news_articles(sample_size=5)
-    for i, text in enumerate(sample_texts):
-        print(f"\n--- Article {i + 1} (Transformers) ---")
-        print(text)
-        print("\nNamed Entities:")
-        results = nlp_ner(text)
+def extract_bert_entities(pipeline_fn, texts):
+    all_preds = []
+    for text in texts:
+        results = pipeline_fn(text)
+        pred_labels = ["O"] * len(text.split())
         for ent in results:
-            print(f"  - {ent['word']} ({ent['entity_group']})")
+            token_span = ent['word'].strip("Ġ").split()
+            for i, token in enumerate(text.split()):
+                if token in token_span:
+                    pred_labels[i] = "B-" + ent['entity_group'] if i == 0 else "I-" + ent['entity_group']
+        all_preds.append(pred_labels)
+    return all_preds
 
 
-def perform_pos_tagging(nlp, texts):
-    all_preds = []
-    all_labels = []
-    for doc in nlp.pipe(texts):
-        all_preds.extend([token.pos_ for token in doc])
-        all_labels.extend([token.tag_ for token in doc])  # using fine-grained tags for reference
-
-    return all_preds, all_labels
-
-
-def perform_pos_tagging_with_transformers():
-    model_checkpoint = "vblagoje/bert-english-uncased-finetuned-pos"
-    tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
-    model = AutoModelForTokenClassification.from_pretrained(model_checkpoint)
-    pos_pipeline = pipeline("token-classification", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
-
-    sample_texts = load_news_articles(sample_size=3)
-    all_preds = []
-    all_labels = []  # Since we don't have gold labels, we use the predicted label for analysis only
-    for text in sample_texts:
-        results = pos_pipeline(text)
-        all_preds.extend([token['entity_group'] for token in results])
-        all_labels.extend([token['entity_group'] for token in results])  # self-comparison (for demo)
-
-    return all_preds, all_labels
-
-
-def evaluate_and_plot(preds, labels, title_prefix="Model"):
-    acc = accuracy_score(labels, preds)
-    f1 = f1_score(labels, preds, average='weighted')
-    print(f"\n{title_prefix} Accuracy: {acc:.2f}")
-    print(f"{title_prefix} F1 Score: {f1:.2f}")
-
-    plt.bar(["Accuracy", "F1 Score"], [acc, f1], color=['skyblue', 'lightgreen'])
-    plt.title(f"{title_prefix} POS Evaluation")
-    plt.ylim(0, 1)
-    plt.ylabel("Score")
-    plt.tight_layout()
-    plt.savefig(f"{title_prefix.lower().replace(' ', '_')}_metrics.png")
-    plt.show()
+def evaluate_predictions(y_true, y_pred, model_name):
+    y_true_flat = [label for seq in y_true for label in seq]
+    y_pred_flat = [label for seq in y_pred for label in seq]
+    precision, recall, f1, _ = precision_recall_fscore_support(y_true_flat, y_pred_flat, average="weighted")
+    print(f"{model_name} - Precision: {precision:.2f}, Recall: {recall:.2f}, F1: {f1:.2f}")
+    return f1
 
 
 def main():
-    print("Loading spaCy model...")
-    nlp = spacy.load("en_core_web_sm")
+    print("Loading data and models...")
+    dataset = load_conll_dataset()
+    tokens = dataset["tokens"]
+    labels = dataset["ner_tags"]
+    label_names = dataset.features["ner_tags"].feature.names
+    gold_labels = [[label_names[l] for l in seq] for seq in labels]
 
-    print("Loading dataset...")
-    articles = load_news_articles()
+    nlp_spacy = spacy.load("en_core_web_sm")
+    nlp_bert = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
 
-    print("\nPerforming Named Entity Recognition with spaCy...")
-    perform_ner(nlp, articles)
+    print("\nEvaluating spaCy...")
+    spacy_preds = extract_spacy_entities(nlp_spacy, tokens)
+    spacy_f1 = evaluate_predictions(gold_labels, spacy_preds, "spaCy")
 
-    print("\nPerforming Named Entity Recognition with Transformers...")
-    perform_ner_with_transformers()
+    print("\nEvaluating BERT...")
+    texts = [" ".join(seq) for seq in tokens]
+    bert_preds = extract_bert_entities(nlp_bert, texts)
+    bert_f1 = evaluate_predictions(gold_labels, bert_preds, "BERT")
 
-    print("\nPerforming POS Tagging with spaCy...")
-    spacy_preds, spacy_labels = perform_pos_tagging(nlp, articles)
-    evaluate_and_plot(spacy_preds, spacy_labels, title_prefix="spaCy")
-
-    print("\nPerforming POS Tagging with Transformers...")
-    transformer_preds, transformer_labels = perform_pos_tagging_with_transformers()
-    evaluate_and_plot(transformer_preds, transformer_labels, title_prefix="Transformers")
+    plt.bar(["spaCy", "BERT"], [spacy_f1, bert_f1], color=["skyblue", "lightgreen"])
+    plt.title("F1 Score Comparison for NER")
+    plt.ylabel("F1 Score")
+    plt.ylim(0, 1)
+    plt.tight_layout()
+    plt.savefig("img/task5-ner_f1_comparison.png")
 
 
 if __name__ == "__main__":
