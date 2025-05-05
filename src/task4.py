@@ -1,156 +1,122 @@
+import torch, numpy as np
 from datasets import load_dataset
-from transformers import BertTokenizer, BertForSequenceClassification, TrainingArguments, Trainer
-from transformers import GPT2Tokenizer, GPT2LMHeadModel, TextDataset, DataCollatorForLanguageModeling
-from transformers import Trainer as GPTTrainer, TrainingArguments as GPTTrainingArguments
-from transformers import T5Tokenizer, T5ForConditionalGeneration
-from transformers import DataCollatorWithPadding
-from transformers import MarianMTModel, MarianTokenizer
+from transformers import (
+    AutoTokenizer, AutoModelForSequenceClassification,
+    DataCollatorWithPadding, Trainer, TrainingArguments,
+    AutoModelForCausalLM, TextDataset, DataCollatorForLanguageModeling
+)
 import evaluate
-import numpy as np
-import matplotlib.pyplot as plt
-import torch
 
-BERT_PLOT_FILENAME = "img/task4-bert.png"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+imdb = load_dataset("imdb")
+bert_tok = AutoTokenizer.from_pretrained("bert-base-uncased")
 
-def get_imdb(tokenizer, sample_train_size=5000, sample_test_size=1000):
-    dataset = load_dataset("imdb")
+def tok_bert(batch):
+    return bert_tok(batch["text"], truncation=True, padding="max_length", max_length=128)
 
-    def tokenize_function(example):
-        return tokenizer(example["text"], truncation=True)
+imdb_tok = imdb.map(tok_bert, batched=True, remove_columns=["text"])
+imdb_tok = imdb_tok.rename_column("label", "labels")
+imdb_tok.set_format("torch", columns=["input_ids","attention_mask","labels"])
 
-    tokenized_datasets = dataset.map(tokenize_function, batched=True)
+bert_model = AutoModelForSequenceClassification.from_pretrained(
+    "bert-base-uncased", num_labels=2
+).to(DEVICE)
+collator = DataCollatorWithPadding(tokenizer=bert_tok)
+metric_acc = evaluate.load("accuracy")
+metric_prf = evaluate.load("precision")
 
-    train_dataset = tokenized_datasets["train"].shuffle(seed=42).select(range(sample_train_size))
-    test_dataset = tokenized_datasets["test"].shuffle(seed=42).select(range(sample_test_size))
+def compute_metrics_bert(eval_pred):
+    preds = np.argmax(eval_pred.predictions, axis=1)
+    labels = eval_pred.label_ids
+    acc = metric_acc.compute(predictions=preds, references=labels)["accuracy"]
+    pr = metric_prf.compute(predictions=preds, references=labels)["precision"]
+    re = evaluate.load("recall").compute(predictions=preds, references=labels)["recall"]
+    f1 = evaluate.load("f1").compute(predictions=preds, references=labels)["f1"]
+    return {"accuracy":acc, "precision":pr, "recall":re, "f1":f1}
 
-    return train_dataset, test_dataset
+args_bert = TrainingArguments(
+    output_dir="bert-out", num_train_epochs=2,
+    per_device_train_batch_size=16, per_device_eval_batch_size=32,
+    eval_strategy="epoch", logging_steps=100, save_strategy="no",
+    learning_rate=2e-5, fp16=torch.cuda.is_available(),
+    dataloader_num_workers=4, report_to="none"
+)
 
+trainer_bert = Trainer(
+    model=bert_model, args=args_bert,
+    train_dataset=imdb_tok["train"].shuffle(seed=42).select(range(5000)),
+    eval_dataset=imdb_tok["test"].shuffle(seed=42).select(range(2000)),
+    tokenizer=bert_tok, data_collator=collator,
+    compute_metrics=compute_metrics_bert
+)
 
-def get_bert_model():
-    model = BertForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=2)
-    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-    return model, tokenizer
+trainer_bert.train()
+bert_results = trainer_bert.evaluate()
+print("BERT results:", bert_results)
 
+shakes = load_dataset(
+    "tiny_shakespeare",
+    trust_remote_code=True
+)
 
-def compute_metrics(eval_pred):
-    accuracy = evaluate.load("accuracy")
-    logits, labels = eval_pred
-    predictions = np.argmax(logits, axis=-1)
-    return accuracy.compute(predictions=predictions, references=labels)
+def save_local(split):
+    path = f"{split}.txt"
+    open(path, "w", encoding="utf-8").write("\n".join(shakes[split]["text"]))
+    return path
 
+train_file = save_local("train")
+eval_file  = save_local("validation")
 
-def plot_metrics(trainer):
-    if trainer.state.log_history:
-        train_accuracies = [log.get("eval_accuracy") for log in trainer.state.log_history if "eval_accuracy" in log]
-        epochs = list(range(1, len(train_accuracies) + 1))
+gpt_tok = AutoTokenizer.from_pretrained("gpt2")
+gpt_tok.pad_token = gpt_tok.eos_token
 
-        plt.figure(figsize=(8, 5))
-        plt.plot(epochs, train_accuracies, marker='o', label="Validation Accuracy")
-        plt.title("Validation Accuracy per Epoch")
-        plt.xlabel("Epoch")
-        plt.ylabel("Accuracy")
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(BERT_PLOT_FILENAME)
+train_ds = TextDataset(tokenizer=gpt_tok, file_path=train_file, block_size=128)
+eval_ds  = TextDataset(tokenizer=gpt_tok, file_path=eval_file,  block_size=128)
+coll_gpt = DataCollatorForLanguageModeling(tokenizer=gpt_tok, mlm=False)
 
+gpt_model = AutoModelForCausalLM.from_pretrained("gpt2").to(DEVICE)
 
-def bert():
-    model, tokenizer = get_bert_model()
-    train, test = get_imdb(tokenizer)
+args_gpt = TrainingArguments(
+    output_dir="gpt2-out", num_train_epochs=3,
+    per_device_train_batch_size=8, per_device_eval_batch_size=8,
+    eval_strategy="epoch", logging_steps=200,
+    save_strategy="epoch", learning_rate=5e-5,
+    fp16=torch.cuda.is_available(), report_to="none"
+)
 
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+trainer_gpt = Trainer(
+    model=gpt_model, args=args_gpt,
+    train_dataset=train_ds, eval_dataset=eval_ds,
+    data_collator=coll_gpt, tokenizer=gpt_tok
+)
 
-    training_args = TrainingArguments(
-        output_dir="./bert-imdb",
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        learning_rate=2e-5,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
-        num_train_epochs=3,
-        weight_decay=0.01,
-        logging_dir="./logs",
-    )
+trainer_gpt.train()
+prompt = "To be, or not to be, "
+inputs = gpt_tok(prompt, return_tensors="pt").to(DEVICE)
+sample = gpt_model.generate(
+    **inputs,
+    max_length=100,
+    do_sample=True,
+    top_k=50,
+    top_p=0.95,
+    temperature=0.8,
+    num_return_sequences=1
+)
+print("GPT-2 sample:\n", gpt_tok.decode(sample[0], skip_special_tokens=True))
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train,
-        eval_dataset=test,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-    )
+from transformers import AutoModelForSeq2SeqLM
+t5_tok = AutoTokenizer.from_pretrained("t5-small")
+t5_model = AutoModelForSeq2SeqLM.from_pretrained("t5-small").to(DEVICE)
 
-    trainer.train()
-    plot_metrics(trainer)
+sent = "The quick brown fox jumps over the lazy dog."
+input_text = "translate English to German: " + sent
+inputs = t5_tok(input_text, return_tensors="pt").to(DEVICE)
 
-
-def gpt():
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    model = GPT2LMHeadModel.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
-
-    train_dataset = TextDataset(
-        tokenizer=tokenizer,
-        file_path="shakespeare.txt",
-        block_size=128
-    )
-
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-
-    training_args = GPTTrainingArguments(
-        output_dir="./gpt-finetuned",
-        overwrite_output_dir=True,
-        num_train_epochs=3,
-        per_device_train_batch_size=2,
-        save_steps=500,
-        save_total_limit=2,
-        logging_dir="./logs"
-    )
-
-    trainer = GPTTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-    )
-
-    trainer.train()
-
-    input_text = "To be, or not to be"
-    input_ids = tokenizer.encode(input_text, return_tensors='pt')
-    output = model.generate(input_ids, max_length=100, num_return_sequences=1)
-    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    print("\nGenerated text:\n", generated_text)
-
-
-def t5_translation():
-    model_name = "Helsinki-NLP/opus-mt-ru-en"
-    tokenizer = MarianTokenizer.from_pretrained(model_name)
-    model = MarianMTModel.from_pretrained(model_name)
-
-    original_text = "Привет, как дела?"
-    inputs = tokenizer(original_text, return_tensors="pt", padding=True)
-
-    translated_ids = model.generate(**inputs)
-    translated_text = tokenizer.decode(translated_ids[0], skip_special_tokens=True)
-
-    print("\nOriginal Russian:\n", original_text)
-    print("\nTranslated English:\n", translated_text)
-
-
-
-def main():
-    # Uncomment to run a model
-    bert()
-    # gpt()
-    # t5_translation()
-
-
-if __name__ == "__main__":
-    main()
-
+outputs = t5_model.generate(
+    **inputs,
+    max_length=64,
+    num_beams=4,
+    early_stopping=True
+)
+print("T5 translation:\n", t5_tok.decode(outputs[0], skip_special_tokens=True))

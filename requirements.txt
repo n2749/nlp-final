@@ -1,0 +1,11 @@
+datasets==3.5.1
+evaluate==0.4.3
+keras==3.9.0
+matplotlib==3.10.1
+numpy==2.2.5
+scikit_learn==1.6.1
+seaborn==0.13.2
+spacy==3.8.3
+tensorflow==2.19.0
+torch==2.6.0+cu126
+transformers==4.49.0

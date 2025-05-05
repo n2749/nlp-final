@@ -1,173 +1,173 @@
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
-from datasets import load_dataset
-from transformers import BertTokenizer, BertForSequenceClassification, TrainingArguments, Trainer
-from transformers import DataCollatorWithPadding
 import torch
-from torch import nn
-from torch.utils.data import DataLoader, Dataset
-from transformers import AdamW
-from tqdm import tqdm
+import random
+import numpy as np
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    Trainer,
+    TrainingArguments,
+)
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    confusion_matrix,
+    classification_report,
+)
+from torch import nn, optim
+from torch.utils.data import Dataset, DataLoader
 
+seed = 42
+torch.manual_seed(seed)
+np.random.seed(seed)
+random.seed(seed)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", DEVICE)
+
+ds = load_dataset("imdb")
+checkpoint = "distilbert-base-uncased"
+tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+
+def tokenize_fn(batch):
+    return tokenizer(
+        batch["text"],
+        truncation=True,
+        padding="max_length",
+        max_length=128
+    )
+
+ds_train = ds["train"].map(tokenize_fn, batched=True, remove_columns=["text"])
+ds_test  = ds["test"].map(tokenize_fn,  batched=True, remove_columns=["text"])
+
+ds_train.set_format(type="torch", columns=["input_ids","attention_mask","label"])
+ds_test .set_format(type="torch", columns=["input_ids","attention_mask","label"])
+
+model = AutoModelForSequenceClassification.from_pretrained(
+    checkpoint, num_labels=2
+).to(DEVICE)
+
+def compute_metrics(p):
+    preds  = np.argmax(p.predictions, axis=1)
+    labels = p.label_ids
+    return {
+        "accuracy": accuracy_score(labels, preds),
+        "f1":       f1_score(labels, preds, average="binary"),
+    }
+
+training_args = TrainingArguments(
+    output_dir="bert-sentiment",
+    num_train_epochs=2,
+    per_device_train_batch_size=32,
+    per_device_eval_batch_size=64,
+    eval_strategy="epoch",
+    logging_steps=100,
+    save_strategy="no",
+    learning_rate=5e-5,
+    fp16=torch.cuda.is_available(),
+    dataloader_num_workers=4,
+    report_to="none",
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=ds_train,
+    eval_dataset=ds_test,
+    tokenizer=tokenizer,
+    compute_metrics=compute_metrics,
+)
+
+trainer.train()
+bert_results = trainer.evaluate()
+print("BERT results:", bert_results)
+
+bert_preds  = np.argmax(trainer.predict(ds_test).predictions, axis=1)
+bert_labels = np.array(ds_test["label"])
 
 class IMDBDataset(Dataset):
-    def __init__(self, encodings, labels):
-        self.encodings = encodings
-        self.labels = labels
-
-    def __getitem__(self, idx):
-        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
-        item['labels'] = torch.tensor(self.labels[idx])
-        return item
-
+    def __init__(self, hf_ds):
+        self.ids    = hf_ds["input_ids"]
+        self.mask   = hf_ds["attention_mask"]
+        self.labels = hf_ds["label"]
     def __len__(self):
         return len(self.labels)
+    def __getitem__(self, idx):
+        return {
+            "input_ids":      self.ids[idx],
+            "attention_mask": self.mask[idx],
+            "labels":         self.labels[idx],
+        }
 
+train_loader = DataLoader(
+    IMDBDataset(ds_train),
+    batch_size=128,
+    shuffle=True,
+    num_workers=0,
+    pin_memory=False,
+)
+test_loader = DataLoader(
+    IMDBDataset(ds_test),
+    batch_size=128,
+    shuffle=False,
+    num_workers=0,
+    pin_memory=False,
+)
 
-class LSTMClassifier(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, output_dim):
-        super(LSTMClassifier, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embedding_dim)
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, output_dim)
-        self.softmax = nn.Sigmoid()
+class BiLSTMSentiment(nn.Module):
+    def __init__(self, vocab_size, embed_dim=128, hidden_dim=128):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, embed_dim,
+                                  padding_idx=tokenizer.pad_token_id)
+        self.lstm  = nn.LSTM(embed_dim, hidden_dim,
+                             batch_first=True, bidirectional=True)
+        self.fc    = nn.Linear(hidden_dim*2, 2)
+    def forward(self, input_ids, attention_mask=None):
+        x = self.embed(input_ids)
+        if attention_mask is not None:
+            x = x * attention_mask.unsqueeze(-1)
+        out, _ = self.lstm(x)
+        fwd = out[:, -1, :out.size(2)//2]
+        bwd = out[:,  0, out.size(2)//2:]
+        return self.fc(torch.cat([fwd, bwd], dim=1))
 
-    def forward(self, input_ids):
-        embedded = self.embedding(input_ids)
-        _, (hidden, _) = self.lstm(embedded)
-        output = self.fc(hidden[-1])
-        return self.softmax(output.squeeze(1))
+lstm_model = BiLSTMSentiment(tokenizer.vocab_size).to(DEVICE)
+optimizer  = optim.Adam(lstm_model.parameters(), lr=1e-3)
+criterion  = nn.CrossEntropyLoss()
 
+for epoch in range(1, 4):
+    lstm_model.train()
+    total_loss = 0
+    for batch in train_loader:
+        ids    = batch["input_ids"].to(DEVICE)
+        mask   = batch["attention_mask"].to(DEVICE)
+        labels = batch["labels"].to(DEVICE)
+        optimizer.zero_grad()
+        logits = lstm_model(ids, mask)
+        loss   = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    print(f"[LSTM] Epoch {epoch} Loss: {total_loss/len(train_loader):.4f}")
 
-def compute_and_plot_metrics(y_true, y_pred, model_name):
-    acc = accuracy_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred)
-    cm = confusion_matrix(y_true, y_pred)
+lstm_model.eval()
+all_preds, all_labels = [], []
+with torch.no_grad():
+    for batch in test_loader:
+        ids    = batch["input_ids"].to(DEVICE)
+        mask   = batch["attention_mask"].to(DEVICE)
+        labels = batch["labels"].to(DEVICE)
+        logits = lstm_model(ids, mask)
+        preds  = torch.argmax(logits, dim=1)
+        all_preds .extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
 
-    print(f"\n{model_name} Accuracy: {acc:.4f}")
-    print(f"{model_name} F1-score: {f1:.4f}")
-
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=["neg", "pos"], yticklabels=["neg", "pos"])
-    plt.title(f"{model_name} Confusion Matrix")
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
-    plt.tight_layout()
-    plt.savefig(f"{model_name.lower().replace(' ', '_')}_confusion_matrix.png")
-    plt.show()
-
-
-def plot_epoch_accuracies(accuracies, model_name):
-    plt.plot(range(1, len(accuracies) + 1), accuracies, marker='o')
-    plt.title(f"{model_name} Accuracy per Epoch")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.ylim(0, 1)
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f"{model_name.lower().replace(' ', '_')}_epoch_accuracy.png")
-    plt.show()
-
-
-def run_bert():
-    dataset = load_dataset("imdb")
-    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-
-    def tokenize_fn(example):
-        return tokenizer(example["text"], truncation=True, padding=True)
-
-    tokenized = dataset.map(tokenize_fn, batched=True)
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-
-    model = BertForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=2)
-
-    training_args = TrainingArguments(
-        output_dir="./bert-imdb",
-        evaluation_strategy="epoch",
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
-        num_train_epochs=2,
-        logging_dir="./logs",
-        logging_steps=100,
-        save_strategy="no"
-    )
-
-    accuracies = []
-
-    def compute_metrics(eval_pred):
-        logits, labels = eval_pred
-        preds = np.argmax(logits, axis=1)
-        acc = accuracy_score(labels, preds)
-        accuracies.append(acc)
-        return {"accuracy": acc}
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized["train"].shuffle(seed=42).select(range(5000)),
-        eval_dataset=tokenized["test"].shuffle(seed=42).select(range(1000)),
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-    )
-
-    trainer.train()
-    predictions = trainer.predict(tokenized["test"].select(range(1000)))
-    preds = np.argmax(predictions.predictions, axis=1)
-    compute_and_plot_metrics(predictions.label_ids, preds, model_name="BERT")
-    plot_epoch_accuracies(accuracies, model_name="BERT")
-
-
-def run_lstm():
-    dataset = load_dataset("imdb")
-    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-
-    tokenized = dataset.map(lambda x: tokenizer(x["text"], truncation=True, padding="max_length", max_length=256), batched=True)
-    vocab_size = tokenizer.vocab_size
-
-    train_dataset = IMDBDataset(tokenized["train"].shuffle(seed=42).select(range(5000)), dataset["train"].shuffle(seed=42).select(range(5000))["label"])
-    test_dataset = IMDBDataset(tokenized["test"].shuffle(seed=42).select(range(1000)), dataset["test"].shuffle(seed=42).select(range(1000))["label"])
-
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=32)
-
-    model = LSTMClassifier(vocab_size=vocab_size, embedding_dim=128, hidden_dim=128, output_dim=1)
-    criterion = nn.BCELoss()
-    optimizer = AdamW(model.parameters(), lr=1e-3)
-
-    lstm_accuracies = []
-    model.train()
-    for epoch in range(2):
-        for batch in tqdm(train_loader):
-            optimizer.zero_grad()
-            output = model(batch['input_ids'])
-            loss = criterion(output, batch['labels'].float())
-            loss.backward()
-            optimizer.step()
-
-        model.eval()
-        epoch_preds = []
-        epoch_labels = []
-        with torch.no_grad():
-            for batch in test_loader:
-                output = model(batch['input_ids'])
-                preds = (output > 0.5).int()
-                epoch_preds.extend(preds.tolist())
-                epoch_labels.extend(batch['labels'].tolist())
-
-        acc = accuracy_score(epoch_labels, epoch_preds)
-        lstm_accuracies.append(acc)
-
-    compute_and_plot_metrics(epoch_labels, epoch_preds, model_name="LSTM")
-    plot_epoch_accuracies(lstm_accuracies, model_name="LSTM")
-
-
-def main():
-    run_bert()
-    run_lstm()
-
-
-if __name__ == "__main__":
-    main()
-
+lstm_acc = accuracy_score(all_labels, all_preds)
+lstm_f1  = f1_score(all_labels, all_preds, average="binary")
+print(f"[LSTM] Accuracy: {lstm_acc:.4f}, F1: {lstm_f1:.4f}")
+print("BERT Confusion Matrix:")
+print(confusion_matrix(bert_labels, bert_preds))
+print(classification_report(bert_labels, bert_preds, digits=4))
+print("\nLSTM Confusion Matrix:")
+print(confusion_matrix(all_labels, all_preds))
+print(classification_report(all_labels, all_preds, digits=4))
